@@ -16,6 +16,7 @@ import {
   DidCommModule,
   DidCommHttpOutboundTransport,
   DidCommWsOutboundTransport,
+  DidCommMessageForwardingStrategy,
   DidCommProofEventTypes,
   DidCommProofStateChangedEvent,
   DidCommBasicMessageRole,
@@ -30,6 +31,12 @@ import { WebSocketServer } from 'ws';
 import { DidCommHttpInboundTransport, DidCommWsInboundTransport, agentDependencies } from '@credo-ts/node';
 import type { Socket } from 'net';
 import { askarPostgresConfig } from './database';
+import { BoundedQueueTransportRepository } from './mediator/bounded-queue-transport-repository';
+
+// Cap on a single inbound WebSocket frame (bytes). The HTTP transport caps the
+// body at 5MB internally, but the ws server defaults to 100MB — this keeps the
+// two transports consistent so a single frame can't be used for exhaustion.
+const MAX_WS_PAYLOAD_BYTES = Number(process.env.MAX_WS_PAYLOAD_BYTES ?? 5 * 1024 * 1024);
 
 const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnType<typeof askarPostgresConfig>) => ({
   askar: new AskarModule({
@@ -43,12 +50,26 @@ const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnTy
   }),
   didcomm: new DidCommModule({
     endpoints: [createAgentDto.endpoint],
+    // Queue for offline recipients and deliver live when they connect. Without
+    // a queueing strategy the mediator drops offline messages entirely.
     mediator: {
       autoAcceptMediationRequests: true,
+      messageForwardingStrategy: DidCommMessageForwardingStrategy.QueueAndLiveModeDelivery,
     },
     connections: {
       autoAcceptConnections: true,
     },
+    // Bounded pickup queue: Credo's default queue is an unbounded in-memory
+    // array, so a peer holding a mediation grant can flood an offline
+    // recipient's queue until the mediator exhausts memory. This caps queue
+    // depth per connection and globally, rejecting overflow instead.
+    queueTransportRepository: new BoundedQueueTransportRepository({
+      maxMessagesPerConnection: Number(process.env.MAX_QUEUE_PER_CONNECTION ?? 200),
+      maxMessagesTotal: Number(process.env.MAX_QUEUE_TOTAL ?? 50000),
+      messageTtlMs: process.env.QUEUE_MESSAGE_TTL_MS
+        ? Number(process.env.QUEUE_MESSAGE_TTL_MS)
+        : undefined,
+    }),
   }),
   cache: new CacheModule({
     cache: new InMemoryLruCache({ limit: 500 }),
@@ -88,7 +109,7 @@ export class AppService {
       });
 
       // Initialize websocket server
-      this.socketServer = new WebSocketServer({ noServer: true });
+      this.socketServer = new WebSocketServer({ noServer: true, maxPayload: MAX_WS_PAYLOAD_BYTES });
       console.log("Created socketServer");
 
       // Create all transports
