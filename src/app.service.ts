@@ -36,11 +36,46 @@ import {
   ONE_WEEK_MS,
   QueueOverflowStrategy,
 } from './mediator/bounded-queue-transport-repository';
+import { AskarQueueTransportRepository } from './mediator/askar-queue-transport-repository';
 
 // Cap on a single inbound WebSocket frame (bytes). The HTTP transport caps the
 // body at 5MB internally, but the ws server defaults to 100MB — this keeps the
 // two transports consistent so a single frame can't be used for exhaustion.
 const MAX_WS_PAYLOAD_BYTES = Number(process.env.MAX_WS_PAYLOAD_BYTES ?? 5 * 1024 * 1024);
+
+const num = (value: string | undefined, fallback: number) => Number(value ?? fallback);
+
+// Build the pickup-queue repository. Default 'askar' persists the queue to the
+// wallet database (Postgres) so it survives a mediator restart; 'memory' uses
+// the in-memory bounded queue (faster, but queued messages are lost on restart).
+const buildQueueRepository = () => {
+  const abuse = {
+    windowMs: num(process.env.ABUSE_WINDOW_MS, 10000),
+    maxMessagesPerWindow: num(process.env.ABUSE_MAX_PER_WINDOW, 500),
+    blockDurationMs: num(process.env.ABUSE_BLOCK_DURATION_MS, 60000),
+  };
+  const common = {
+    maxMessagesPerConnection: num(process.env.MAX_QUEUE_PER_CONNECTION, 200),
+    maxBytesPerConnection: num(process.env.MAX_QUEUE_BYTES_PER_CONNECTION, 20 * 1024 * 1024),
+    maxMessageBytes: num(process.env.MAX_MESSAGE_BYTES, 5 * 1024 * 1024),
+    messageTtlMs: num(process.env.QUEUE_MESSAGE_TTL_MS, ONE_WEEK_MS),
+    abuse,
+  };
+
+  if ((process.env.QUEUE_PERSISTENCE ?? 'askar') === 'memory') {
+    return new BoundedQueueTransportRepository({
+      ...common,
+      maxMessagesTotal: num(process.env.MAX_QUEUE_TOTAL, 50000),
+      maxBytesTotal: num(process.env.MAX_QUEUE_BYTES_TOTAL, 500 * 1024 * 1024),
+      overflowStrategy: (process.env.QUEUE_OVERFLOW_STRATEGY as QueueOverflowStrategy) ?? 'drop-oldest',
+    });
+  }
+
+  return new AskarQueueTransportRepository({
+    ...common,
+    maxMessagesTotal: num(process.env.MAX_QUEUE_TOTAL, 500000),
+  });
+};
 
 const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnType<typeof askarPostgresConfig>) => ({
   askar: new AskarModule({
@@ -66,23 +101,10 @@ const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnTy
     // Bounded pickup queue: Credo's default queue is an unbounded in-memory
     // array, so a peer holding a mediation grant can flood an offline
     // recipient's queue until the mediator exhausts memory. This caps queue
-    // depth per connection and globally. On overflow it drops the oldest
-    // pending message (self-healing) rather than blocking new traffic, and
-    // evicts any message older than the TTL (default one week).
-    queueTransportRepository: new BoundedQueueTransportRepository({
-      maxMessagesPerConnection: Number(process.env.MAX_QUEUE_PER_CONNECTION ?? 200),
-      maxMessagesTotal: Number(process.env.MAX_QUEUE_TOTAL ?? 50000),
-      maxBytesPerConnection: Number(process.env.MAX_QUEUE_BYTES_PER_CONNECTION ?? 20 * 1024 * 1024),
-      maxBytesTotal: Number(process.env.MAX_QUEUE_BYTES_TOTAL ?? 500 * 1024 * 1024),
-      maxMessageBytes: Number(process.env.MAX_MESSAGE_BYTES ?? 5 * 1024 * 1024),
-      messageTtlMs: Number(process.env.QUEUE_MESSAGE_TTL_MS ?? ONE_WEEK_MS),
-      overflowStrategy: (process.env.QUEUE_OVERFLOW_STRATEGY as QueueOverflowStrategy) ?? 'drop-oldest',
-      abuse: {
-        windowMs: Number(process.env.ABUSE_WINDOW_MS ?? 10000),
-        maxMessagesPerWindow: Number(process.env.ABUSE_MAX_PER_WINDOW ?? 500),
-        blockDurationMs: Number(process.env.ABUSE_BLOCK_DURATION_MS ?? 60000),
-      },
-    }),
+    // depth and bytes per connection, evicts messages older than the TTL
+    // (default one week), and detects/blocks abusive senders. By default it is
+    // persisted to the wallet database so the queue survives a restart.
+    queueTransportRepository: buildQueueRepository(),
   }),
   cache: new CacheModule({
     cache: new InMemoryLruCache({ limit: 500 }),
