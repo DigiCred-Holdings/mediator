@@ -31,7 +31,11 @@ import { WebSocketServer } from 'ws';
 import { DidCommHttpInboundTransport, DidCommWsInboundTransport, agentDependencies } from '@credo-ts/node';
 import type { Socket } from 'net';
 import { askarPostgresConfig } from './database';
-import { BoundedQueueTransportRepository } from './mediator/bounded-queue-transport-repository';
+import {
+  BoundedQueueTransportRepository,
+  ONE_WEEK_MS,
+  QueueOverflowStrategy,
+} from './mediator/bounded-queue-transport-repository';
 
 // Cap on a single inbound WebSocket frame (bytes). The HTTP transport caps the
 // body at 5MB internally, but the ws server defaults to 100MB — this keeps the
@@ -62,13 +66,22 @@ const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnTy
     // Bounded pickup queue: Credo's default queue is an unbounded in-memory
     // array, so a peer holding a mediation grant can flood an offline
     // recipient's queue until the mediator exhausts memory. This caps queue
-    // depth per connection and globally, rejecting overflow instead.
+    // depth per connection and globally. On overflow it drops the oldest
+    // pending message (self-healing) rather than blocking new traffic, and
+    // evicts any message older than the TTL (default one week).
     queueTransportRepository: new BoundedQueueTransportRepository({
       maxMessagesPerConnection: Number(process.env.MAX_QUEUE_PER_CONNECTION ?? 200),
       maxMessagesTotal: Number(process.env.MAX_QUEUE_TOTAL ?? 50000),
-      messageTtlMs: process.env.QUEUE_MESSAGE_TTL_MS
-        ? Number(process.env.QUEUE_MESSAGE_TTL_MS)
-        : undefined,
+      maxBytesPerConnection: Number(process.env.MAX_QUEUE_BYTES_PER_CONNECTION ?? 20 * 1024 * 1024),
+      maxBytesTotal: Number(process.env.MAX_QUEUE_BYTES_TOTAL ?? 500 * 1024 * 1024),
+      maxMessageBytes: Number(process.env.MAX_MESSAGE_BYTES ?? 5 * 1024 * 1024),
+      messageTtlMs: Number(process.env.QUEUE_MESSAGE_TTL_MS ?? ONE_WEEK_MS),
+      overflowStrategy: (process.env.QUEUE_OVERFLOW_STRATEGY as QueueOverflowStrategy) ?? 'drop-oldest',
+      abuse: {
+        windowMs: Number(process.env.ABUSE_WINDOW_MS ?? 10000),
+        maxMessagesPerWindow: Number(process.env.ABUSE_MAX_PER_WINDOW ?? 500),
+        blockDurationMs: Number(process.env.ABUSE_BLOCK_DURATION_MS ?? 60000),
+      },
     }),
   }),
   cache: new CacheModule({
