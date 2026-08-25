@@ -1,7 +1,7 @@
 import { ConfigService } from '@nestjs/config';
-import type { AskarWalletPostgresStorageConfig } from '@credo-ts/askar/build/wallet';
+import type { AskarPostgresStorageConfig } from '@credo-ts/askar';
 
-export const askarPostgresConfig = (configService: ConfigService): AskarWalletPostgresStorageConfig => ({
+export const askarPostgresConfig = (configService: ConfigService): AskarPostgresStorageConfig => ({
   type: 'postgres',
   config: {
     host: configService.get<string>('POSTGRES_HOST'),
