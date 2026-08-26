@@ -36,6 +36,7 @@ import {
   QueueOverflowStrategy,
 } from './mediator/bounded-queue-transport-repository';
 import { AskarQueueTransportRepository } from './mediator/askar-queue-transport-repository';
+import { PushNotificationsService } from './mediator/push/push-notifications.service';
 
 // ws defaults to 100MB per frame; match the HTTP transport's 5MB body cap.
 const MAX_WS_PAYLOAD_BYTES = Number(process.env.MAX_WS_PAYLOAD_BYTES ?? 5 * 1024 * 1024);
@@ -108,6 +109,7 @@ export class AppService {
   agent: MediatorAgent;
   label: string;
   socketServer: WebSocketServer;
+  private readonly pushNotifications = new PushNotificationsService();
 
   constructor(private configService: ConfigService) {}
 
@@ -153,6 +155,8 @@ export class AppService {
       console.log("Agent pre-initialize");
       await this.agent.initialize().catch(console.error);
       console.log("Agent initialized");
+
+      this.pushNotifications.setup(this.agent);
 
       httpInboundTransport.server?.on('upgrade', (request, socket, head) => {
         this.socketServer.handleUpgrade(request, socket as Socket, head, (socket) => {
