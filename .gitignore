@@ -131,3 +131,10 @@ dist
 
 # Deployment scripts / infra (kept out of git)
 deploy/
+
+# Firebase / push-notification service-account credentials
+service-account*.json
+serviceAccount*.json
+*service-account*.json
+firebase-adminsdk*.json
+*.serviceaccount.json
