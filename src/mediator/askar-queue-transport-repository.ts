@@ -54,6 +54,15 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
 
   // Global pending count, seeded lazily from the store, then maintained.
   private globalPending?: number;
+  private globalSeed?: Promise<number>;
+
+  // Per-connection write serialization. With processDidCommMessagesConcurrently
+  // enabled, addMessage/takeFromQueue for the same connection can interleave and
+  // race (double drop-oldest, cap overshoot). Chaining them per connection keeps
+  // each connection's queue consistent while different connections still run
+  // concurrently. NOTE: this guards a single process only — running multiple
+  // mediator instances against one database would need DB-level locking.
+  private readonly connectionLocks = new Map<string, Promise<unknown>>();
 
   public constructor(options: AskarQueueTransportRepositoryOptions = {}) {
     this.maxMessagesPerConnection = options.maxMessagesPerConnection ?? 200;
@@ -74,6 +83,23 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
     if (this.messageTtlMs < 0) throw new CredoError('messageTtlMs must be >= 0');
   }
 
+  /** Run `fn` serially with respect to other operations on the same connection. */
+  private withConnectionLock<T>(connectionId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.connectionLocks.get(connectionId) ?? Promise.resolve();
+    const result = previous.then(fn, fn);
+    // Keep a settled (error-swallowed) tail so the chain never breaks; drop the
+    // entry once this op is the last one, to bound the map size.
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.connectionLocks.set(connectionId, tail);
+    void tail.then(() => {
+      if (this.connectionLocks.get(connectionId) === tail) this.connectionLocks.delete(connectionId);
+    });
+    return result;
+  }
+
   private getRepository(agentContext: AgentContext): Repository<QueuedMessageRecord> {
     const storageService = agentContext.dependencyManager.resolve<StorageService<QueuedMessageRecord>>(
       InjectionSymbols.StorageService,
@@ -88,8 +114,28 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
     repository: Repository<QueuedMessageRecord>,
   ): Promise<void> {
     if (this.globalPending !== undefined) return;
-    const pending = await repository.findByQuery(agentContext, { state: 'pending' });
-    this.globalPending = pending.length;
+    // Guard against concurrent first-calls both running the seed query.
+    if (!this.globalSeed) {
+      this.globalSeed = repository
+        .findByQuery(agentContext, { state: 'pending' })
+        .then((pending) => pending.length);
+    }
+    this.globalPending = await this.globalSeed;
+  }
+
+  /** Delete by id, ignoring the case where a concurrent op already removed it. */
+  private async deleteIfPresent(
+    agentContext: AgentContext,
+    repository: Repository<QueuedMessageRecord>,
+    id: string,
+  ): Promise<boolean> {
+    try {
+      await repository.deleteById(agentContext, id);
+      this.decrementGlobal();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Load a connection's pending rows, evicting any that have expired. */
@@ -108,8 +154,7 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
       const cutoff = Date.now() - this.messageTtlMs;
       const expired = records.filter((r) => r.receivedAtMs < cutoff);
       for (const record of expired) {
-        await repository.deleteById(agentContext, record.id);
-        this.decrementGlobal();
+        await this.deleteIfPresent(agentContext, repository, record.id);
       }
       records = records.filter((r) => r.receivedAtMs >= cutoff);
     }
@@ -129,33 +174,36 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
     return pending.length;
   }
 
-  public async takeFromQueue(
+  public takeFromQueue(
     agentContext: AgentContext,
     options: { connectionId: string; recipientDid?: string; limit?: number; deleteMessages?: boolean },
   ): Promise<QueuedDidCommMessage[]> {
-    const repository = this.getRepository(agentContext);
     const { connectionId, recipientDid, limit, deleteMessages } = options;
 
-    let records = await this.loadPending(agentContext, repository, connectionId, recipientDid);
-    // Oldest first, so pickup order is FIFO.
-    records.sort((a, b) => a.receivedAtMs - b.receivedAtMs);
-    if (limit !== undefined) records = records.slice(0, limit);
+    return this.withConnectionLock(connectionId, async () => {
+      const repository = this.getRepository(agentContext);
+      let records = await this.loadPending(agentContext, repository, connectionId, recipientDid);
+      // Oldest first, so pickup order is FIFO.
+      records.sort((a, b) => a.receivedAtMs - b.receivedAtMs);
+      if (limit !== undefined) records = records.slice(0, limit);
 
-    for (const record of records) {
-      if (deleteMessages) {
-        await repository.deleteById(agentContext, record.id);
-        this.decrementGlobal();
-      } else {
-        record.state = 'sending';
-        await repository.update(agentContext, record);
+      const taken: QueuedMessageRecord[] = [];
+      for (const record of records) {
+        if (deleteMessages) {
+          if (await this.deleteIfPresent(agentContext, repository, record.id)) taken.push(record);
+        } else {
+          record.state = 'sending';
+          await repository.update(agentContext, record);
+          taken.push(record);
+        }
       }
-    }
 
-    return records.map((record) => ({
-      id: record.id,
-      receivedAt: new Date(record.receivedAtMs),
-      encryptedMessage: record.encryptedMessage,
-    }));
+      return taken.map((record) => ({
+        id: record.id,
+        receivedAt: new Date(record.receivedAtMs),
+        encryptedMessage: record.encryptedMessage,
+      }));
+    });
   }
 
   public async addMessage(
@@ -167,9 +215,12 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
       receivedAt?: Date;
     },
   ): Promise<string> {
-    const repository = this.getRepository(agentContext);
     const { connectionId, recipientDids, payload } = options;
     const logger = agentContext.config.logger;
+
+    // Abuse detection and the per-message size check touch no DB state, so run
+    // them before taking the per-connection lock — abusive floods are rejected
+    // cheaply without serializing behind other work.
 
     // 1. Abuse detection: turn away a flooding connection cheaply (no DB hit).
     if (this.abuseMonitor?.record(connectionId)) {
@@ -187,63 +238,64 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
       );
     }
 
-    await this.ensureGlobalCount(agentContext, repository);
+    return this.withConnectionLock(connectionId, async () => {
+      const repository = this.getRepository(agentContext);
+      await this.ensureGlobalCount(agentContext, repository);
 
-    // 3. Global cap: reject when full (disk guardrail).
-    if ((this.globalPending ?? 0) >= this.maxMessagesTotal) {
-      throw new MediatorQueueLimitReachedError(`Global message queue is full (${this.maxMessagesTotal} messages)`);
-    }
+      // 3. Global cap: reject when full (disk guardrail).
+      if ((this.globalPending ?? 0) >= this.maxMessagesTotal) {
+        throw new MediatorQueueLimitReachedError(`Global message queue is full (${this.maxMessagesTotal} messages)`);
+      }
 
-    // 4. Per-connection caps (count + bytes): drop oldest to make room.
-    const pending = await this.loadPending(agentContext, repository, connectionId);
-    pending.sort((a, b) => a.receivedAtMs - b.receivedAtMs); // oldest first
-    let currentCount = pending.length;
-    let currentBytes = pending.reduce((total, r) => total + r.byteSize, 0);
-    let dropIndex = 0;
+      // 4. Per-connection caps (count + bytes): drop oldest to make room.
+      const pending = await this.loadPending(agentContext, repository, connectionId);
+      pending.sort((a, b) => a.receivedAtMs - b.receivedAtMs); // oldest first
+      let currentCount = pending.length;
+      let currentBytes = pending.reduce((total, r) => total + r.byteSize, 0);
+      let dropIndex = 0;
 
-    while (
-      currentCount >= this.maxMessagesPerConnection ||
-      currentBytes + byteSize > this.maxBytesPerConnection
-    ) {
-      if (dropIndex >= pending.length) break; // nothing left to drop
-      const oldest = pending[dropIndex++];
-      await repository.deleteById(agentContext, oldest.id);
-      this.decrementGlobal();
-      currentCount -= 1;
-      currentBytes -= oldest.byteSize;
-      logger.warn(`Mediator queue for connection ${connectionId} full; dropped oldest pending message`);
-    }
+      while (
+        currentCount >= this.maxMessagesPerConnection ||
+        currentBytes + byteSize > this.maxBytesPerConnection
+      ) {
+        if (dropIndex >= pending.length) break; // nothing left to drop
+        const oldest = pending[dropIndex++];
+        if (await this.deleteIfPresent(agentContext, repository, oldest.id)) {
+          currentCount -= 1;
+          currentBytes -= oldest.byteSize;
+          logger.warn(`Mediator queue for connection ${connectionId} full; dropped oldest pending message`);
+        }
+      }
 
-    const id = utils.uuid();
-    await repository.save(
-      agentContext,
-      new QueuedMessageRecord({
-        id,
-        connectionId,
-        recipientDids,
-        encryptedMessage: payload,
-        byteSize,
-        receivedAtMs: (options.receivedAt ?? new Date()).getTime(),
-        state: 'pending',
-      }),
-    );
-    if (this.globalPending !== undefined) this.globalPending += 1;
+      const id = utils.uuid();
+      await repository.save(
+        agentContext,
+        new QueuedMessageRecord({
+          id,
+          connectionId,
+          recipientDids,
+          encryptedMessage: payload,
+          byteSize,
+          receivedAtMs: (options.receivedAt ?? new Date()).getTime(),
+          state: 'pending',
+        }),
+      );
+      if (this.globalPending !== undefined) this.globalPending += 1;
 
-    return id;
+      return id;
+    });
   }
 
-  public async removeMessages(
+  public removeMessages(
     agentContext: AgentContext,
     options: { connectionId: string; messageIds: string[] },
   ): Promise<void> {
-    const repository = this.getRepository(agentContext);
-    for (const messageId of options.messageIds) {
-      try {
-        await repository.deleteById(agentContext, messageId);
-        this.decrementGlobal();
-      } catch {
-        // Already gone (picked up / expired) — nothing to do.
+    return this.withConnectionLock(options.connectionId, async () => {
+      const repository = this.getRepository(agentContext);
+      for (const messageId of options.messageIds) {
+        // deleteIfPresent tolerates a concurrent removal.
+        await this.deleteIfPresent(agentContext, repository, messageId);
       }
-    }
+    });
   }
 }

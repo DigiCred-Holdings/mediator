@@ -117,6 +117,37 @@ describe('AskarQueueTransportRepository (persistent queue)', () => {
     ).rejects.toBeInstanceOf(MediatorQueueLimitReachedError);
   });
 
+  it('stays consistent under concurrent addMessage for the same connection', async () => {
+    agent = await createAgent(inMemoryDb());
+    ctx = agent.context;
+    const repo = new AskarQueueTransportRepository({ maxMessagesPerConnection: 10, abuse: false });
+
+    // Fire 60 forwards at one connection concurrently (as the concurrency flag
+    // would). Without per-connection serialization these race: double
+    // drop-oldest deletes and cap overshoot.
+    const results = await Promise.allSettled(
+      Array.from({ length: 60 }, (_, i) => add(repo, ctx, 'conn', `m${i}`)),
+    );
+
+    // No forward errored, and the cap held exactly.
+    expect(results.every((r) => r.status === 'fulfilled')).toBe(true);
+    expect(await repo.getAvailableMessageCount(ctx, { connectionId: 'conn' })).toBe(10);
+  });
+
+  it('processes different connections concurrently without interference', async () => {
+    agent = await createAgent(inMemoryDb());
+    ctx = agent.context;
+    const repo = new AskarQueueTransportRepository({ maxMessagesPerConnection: 100, abuse: false });
+
+    await Promise.all([
+      ...Array.from({ length: 20 }, (_, i) => add(repo, ctx, 'conn-a', `a${i}`)),
+      ...Array.from({ length: 20 }, (_, i) => add(repo, ctx, 'conn-b', `b${i}`)),
+    ]);
+
+    expect(await repo.getAvailableMessageCount(ctx, { connectionId: 'conn-a' })).toBe(20);
+    expect(await repo.getAvailableMessageCount(ctx, { connectionId: 'conn-b' })).toBe(20);
+  });
+
   it('persists queued messages across a mediator restart', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'mediator-queue-'));
     const database = { type: 'sqlite', config: { path: join(dir, 'wallet.db') } };

@@ -89,6 +89,12 @@ const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnTy
   }),
   didcomm: new DidCommModule({
     endpoints: [createAgentDto.endpoint],
+    // Process inbound DIDComm messages concurrently (overlapping async I/O such
+    // as DB queue writes) instead of one-at-a-time. Node stays single-threaded;
+    // this just removes the serial bottleneck. The Askar queue is made safe for
+    // this via per-connection write serialization. Default on; set
+    // PROCESS_MESSAGES_CONCURRENTLY=false to restore strictly serial processing.
+    processDidCommMessagesConcurrently: (process.env.PROCESS_MESSAGES_CONCURRENTLY ?? 'true') !== 'false',
     // Queue for offline recipients and deliver live when they connect. Without
     // a queueing strategy the mediator drops offline messages entirely.
     mediator: {
