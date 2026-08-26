@@ -1,41 +1,18 @@
 import { CredoError } from '@credo-ts/core';
 
-/**
- * Thrown when a connection is temporarily blocked for an abusive send rate.
- */
 export class MediatorAbuseDetectedError extends CredoError {}
 
 export interface AbuseMonitorOptions {
-  /**
-   * Sliding window (ms) over which forward rate is measured.
-   *
-   * @default 10000 (10s)
-   */
+  /** @default 10000 (10s) */
   windowMs?: number;
-  /**
-   * Maximum forwards a single connection may send within `windowMs` before it
-   * is flagged as abusive and blocked.
-   *
-   * @default 500
-   */
+  /** @default 500 */
   maxMessagesPerWindow?: number;
-  /**
-   * How long (ms) a flagged connection stays blocked. While blocked, its
-   * forwards are rejected outright.
-   *
-   * @default 60000 (60s)
-   */
+  /** @default 60000 (60s) */
   blockDurationMs?: number;
 }
 
-/**
- * Per-connection rate-based abuse detector.
- *
- * A connection that exceeds `maxMessagesPerWindow` forwards within `windowMs`
- * is flagged and blocked for `blockDurationMs`. While blocked, its forwards are
- * rejected without touching the queue, so a fast flood is turned away cheaply
- * instead of being processed (and drop-oldest-churned) message by message.
- */
+// Per-connection rate limiter: blocks a connection that exceeds
+// maxMessagesPerWindow forwards within windowMs for blockDurationMs.
 export class AbuseMonitor {
   private readonly windowMs: number;
   private readonly maxMessagesPerWindow: number;
@@ -54,10 +31,6 @@ export class AbuseMonitor {
     if (this.blockDurationMs < 1) throw new CredoError('blockDurationMs must be at least 1');
   }
 
-  /**
-   * Whether the connection is currently blocked. Lapsed blocks are cleared as a
-   * side effect.
-   */
   public isBlocked(connectionId: string, now = Date.now()): boolean {
     const until = this.blockedUntil.get(connectionId);
     if (until === undefined) return false;
@@ -69,10 +42,7 @@ export class AbuseMonitor {
     return true;
   }
 
-  /**
-   * Record a forward from `connectionId`. Returns `true` if the connection is
-   * (now) blocked and the forward should be rejected.
-   */
+  // Returns true if the connection is (now) blocked and the forward should be rejected.
   public record(connectionId: string, now = Date.now()): boolean {
     if (this.isBlocked(connectionId, now)) return true;
 
@@ -81,7 +51,6 @@ export class AbuseMonitor {
     recent.push(now);
 
     if (recent.length > this.maxMessagesPerWindow) {
-      // Trip the block; drop the per-hit history to free memory.
       this.blockedUntil.set(connectionId, now + this.blockDurationMs);
       this.hits.delete(connectionId);
       return true;
@@ -91,7 +60,6 @@ export class AbuseMonitor {
     return false;
   }
 
-  /** Connections currently blocked (for logging / observability). */
   public blockedConnections(now = Date.now()): string[] {
     const blocked: string[] = [];
     for (const [connectionId] of this.blockedUntil) {

@@ -1,5 +1,4 @@
-// Keep this import first so the native askar bindings are registered before
-// any @credo-ts package loads (they capture the binding at module load time).
+// Must load before any @credo-ts package: registers the native askar bindings.
 import { askarNodeJS } from '@openwallet-foundation/askar-nodejs';
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -38,16 +37,12 @@ import {
 } from './mediator/bounded-queue-transport-repository';
 import { AskarQueueTransportRepository } from './mediator/askar-queue-transport-repository';
 
-// Cap on a single inbound WebSocket frame (bytes). The HTTP transport caps the
-// body at 5MB internally, but the ws server defaults to 100MB — this keeps the
-// two transports consistent so a single frame can't be used for exhaustion.
+// ws defaults to 100MB per frame; match the HTTP transport's 5MB body cap.
 const MAX_WS_PAYLOAD_BYTES = Number(process.env.MAX_WS_PAYLOAD_BYTES ?? 5 * 1024 * 1024);
 
 const num = (value: string | undefined, fallback: number) => Number(value ?? fallback);
 
-// Build the pickup-queue repository. Default 'askar' persists the queue to the
-// wallet database (Postgres) so it survives a mediator restart; 'memory' uses
-// the in-memory bounded queue (faster, but queued messages are lost on restart).
+// 'askar' persists the queue to Postgres (survives restart); 'memory' does not.
 const buildQueueRepository = () => {
   const abuse = {
     windowMs: num(process.env.ABUSE_WINDOW_MS, 10000),
@@ -89,14 +84,7 @@ const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnTy
   }),
   didcomm: new DidCommModule({
     endpoints: [createAgentDto.endpoint],
-    // Process inbound DIDComm messages concurrently (overlapping async I/O such
-    // as DB queue writes) instead of one-at-a-time. Node stays single-threaded;
-    // this just removes the serial bottleneck. The Askar queue is made safe for
-    // this via per-connection write serialization. Default on; set
-    // PROCESS_MESSAGES_CONCURRENTLY=false to restore strictly serial processing.
     processDidCommMessagesConcurrently: (process.env.PROCESS_MESSAGES_CONCURRENTLY ?? 'true') !== 'false',
-    // Queue for offline recipients and deliver live when they connect. Without
-    // a queueing strategy the mediator drops offline messages entirely.
     mediator: {
       autoAcceptMediationRequests: true,
       messageForwardingStrategy: DidCommMessageForwardingStrategy.QueueAndLiveModeDelivery,
@@ -104,12 +92,6 @@ const getAgentModules = (createAgentDto: CreateAgentDto, storageConfig: ReturnTy
     connections: {
       autoAcceptConnections: true,
     },
-    // Bounded pickup queue: Credo's default queue is an unbounded in-memory
-    // array, so a peer holding a mediation grant can flood an offline
-    // recipient's queue until the mediator exhausts memory. This caps queue
-    // depth and bytes per connection, evicts messages older than the TTL
-    // (default one week), and detects/blocks abusive senders. By default it is
-    // persisted to the wallet database so the queue survives a restart.
     queueTransportRepository: buildQueueRepository(),
   }),
   cache: new CacheModule({

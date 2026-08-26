@@ -8,81 +8,32 @@ import { AbuseMonitor, AbuseMonitorOptions, MediatorAbuseDetectedError } from '.
 
 export { MediatorAbuseDetectedError } from './abuse-monitor';
 
-/**
- * One week, the default lifetime of a queued-but-undelivered message.
- */
 export const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
 const MB = 1024 * 1024;
 
-/**
- * What to do when a queue is full and a new message arrives.
- *
- * - `drop-oldest` (default): evict the oldest pending message to make room for
- *   the new one. The newest message always gets through and a stuck queue
- *   self-heals; the trade-off is that the oldest undelivered message is lost.
- * - `reject`: refuse the new message with {@link MediatorQueueLimitReachedError}.
- */
+// drop-oldest: evict the oldest pending message to admit the new one.
+// reject: refuse the new message with MediatorQueueLimitReachedError.
 export type QueueOverflowStrategy = 'drop-oldest' | 'reject';
 
-/**
- * Thrown when a message cannot be queued because a size/count limit is reached
- * (either an oversize single message, or the `reject` overflow strategy).
- */
 export class MediatorQueueLimitReachedError extends CredoError {}
 
 export interface BoundedQueueTransportRepositoryOptions {
-  /**
-   * Maximum number of pending messages that may be queued for a single
-   * mediated connection.
-   *
-   * @default 200
-   */
+  /** @default 200 */
   maxMessagesPerConnection?: number;
-  /**
-   * Maximum number of pending messages across all connections.
-   *
-   * @default 50000
-   */
+  /** @default 50000 */
   maxMessagesTotal?: number;
-  /**
-   * Maximum total bytes of queued messages for a single connection. Protects
-   * against a few large messages exhausting memory even when the message
-   * *count* is low.
-   *
-   * @default 20 * 1024 * 1024 (20 MB)
-   */
+  /** @default 20 * 1024 * 1024 (20 MB) */
   maxBytesPerConnection?: number;
-  /**
-   * Maximum total bytes of queued messages across all connections.
-   *
-   * @default 500 * 1024 * 1024 (500 MB)
-   */
+  /** @default 500 * 1024 * 1024 (500 MB) */
   maxBytesTotal?: number;
-  /**
-   * Maximum size (bytes) of a single queued message. Larger messages are
-   * rejected outright (dropping older messages cannot make room for one that
-   * is itself too big).
-   *
-   * @default 5 * 1024 * 1024 (5 MB, matching the HTTP transport body cap)
-   */
+  /** @default 5 * 1024 * 1024 (5 MB) */
   maxMessageBytes?: number;
-  /**
-   * Time-to-live (ms) for a queued message. Messages older than this are
-   * evicted lazily on the next queue operation. Set to `0` to disable.
-   *
-   * @default ONE_WEEK_MS (7 days)
-   */
+  /** @default ONE_WEEK_MS (7 days); 0 disables TTL eviction */
   messageTtlMs?: number;
-  /**
-   * Behaviour when a per-connection or global limit is reached.
-   *
-   * @default 'drop-oldest'
-   */
+  /** @default 'drop-oldest' */
   overflowStrategy?: QueueOverflowStrategy;
-  /**
-   * Rate-based abuse detection. Pass `false` to disable, or options to tune it.
-   */
+  /** Rate-based abuse detection; `false` disables it. */
   abuse?: AbuseMonitorOptions | false;
 }
 
@@ -99,17 +50,7 @@ interface StoredMessage {
 const byteSizeOf = (payload: DidCommEncryptedMessage): number =>
   Buffer.byteLength(JSON.stringify(payload), 'utf8');
 
-/**
- * A drop-in replacement for Credo's default `InMemoryQueueTransportRepository`
- * that bounds queue growth so a mediator cannot be driven out of memory.
- *
- * Protections:
- *  - per-connection and global caps on message *count* and *bytes*,
- *  - per-message size cap,
- *  - TTL eviction of stale messages (default one week),
- *  - drop-oldest overflow (default) so new traffic is never blocked, and
- *  - rate-based abuse detection that blocks a flooding connection.
- */
+// Bounded in-memory replacement for Credo's unbounded InMemoryQueueTransportRepository.
 export class BoundedQueueTransportRepository implements DidCommQueueTransportRepository {
   private messages: StoredMessage[] = [];
   private readonly maxMessagesPerConnection: number;
@@ -171,11 +112,6 @@ export class BoundedQueueTransportRepository implements DidCommQueueTransportRep
     return messages.reduce((total, msg) => total + msg.byteSize, 0);
   }
 
-  /**
-   * Remove the oldest pending message matching `predicate`. Only `pending`
-   * messages are candidates — messages already being delivered (`sending`) are
-   * left alone. Returns true if one was removed.
-   */
   private dropOldestPending(predicate: (msg: StoredMessage) => boolean): boolean {
     let oldestIndex = -1;
     let oldestTime = Number.POSITIVE_INFINITY;
@@ -235,7 +171,6 @@ export class BoundedQueueTransportRepository implements DidCommQueueTransportRep
     const { connectionId, recipientDids, payload } = options;
     const logger = agentContext.config.logger;
 
-    // 1. Abuse detection: turn away a flooding connection cheaply.
     if (this.abuseMonitor?.record(connectionId)) {
       logger.warn(`Mediator blocked forward from connection ${connectionId}: abusive send rate`);
       throw new MediatorAbuseDetectedError(
@@ -243,7 +178,6 @@ export class BoundedQueueTransportRepository implements DidCommQueueTransportRep
       );
     }
 
-    // 2. Per-message size cap: an oversize message can never be made to fit.
     const byteSize = byteSizeOf(payload);
     if (byteSize > this.maxMessageBytes) {
       throw new MediatorQueueLimitReachedError(
@@ -251,7 +185,6 @@ export class BoundedQueueTransportRepository implements DidCommQueueTransportRep
       );
     }
 
-    // 3. Global caps (count + bytes): make room across all connections.
     this.makeRoom(
       () => this.messages.length >= this.maxMessagesTotal || this.sumBytes(this.messages) + byteSize > this.maxBytesTotal,
       () => true,
@@ -259,7 +192,6 @@ export class BoundedQueueTransportRepository implements DidCommQueueTransportRep
       `Global message queue is full`,
     );
 
-    // 4. Per-connection caps (count + bytes): make room within this connection.
     this.makeRoom(
       () => {
         const pending = this.pendingForConnection(connectionId);
@@ -283,10 +215,6 @@ export class BoundedQueueTransportRepository implements DidCommQueueTransportRep
     return id;
   }
 
-  /**
-   * While `overLimit()` holds, either drop the oldest pending message matching
-   * `dropPredicate` (drop-oldest strategy) or reject with an error.
-   */
   private makeRoom(
     overLimit: () => boolean,
     dropPredicate: (msg: StoredMessage) => boolean,

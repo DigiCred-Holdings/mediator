@@ -10,8 +10,7 @@ export interface QueuedMessageRecordProps {
   recipientDids: string[];
   encryptedMessage: DidCommEncryptedMessage;
   byteSize: number;
-  /** Reception time as epoch ms, used for TTL and drop-oldest ordering. */
-  receivedAtMs: number;
+  receivedAtMs: number; // epoch ms, for TTL and drop-oldest ordering
   state: QueuedMessageState;
 }
 
@@ -21,11 +20,6 @@ type DefaultQueuedMessageTags = {
   recipientDids: string[];
 };
 
-/**
- * A single mediated message waiting in the pickup queue, persisted via the
- * agent's storage service (Askar → Postgres). This is what makes the queue
- * survive a mediator restart, unlike the in-memory queue.
- */
 export class QueuedMessageRecord extends BaseRecord<DefaultQueuedMessageTags> {
   public static readonly type = 'MediatorQueuedMessage';
   public readonly type = QueuedMessageRecord.type;

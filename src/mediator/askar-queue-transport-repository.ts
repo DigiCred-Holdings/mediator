@@ -24,26 +24,16 @@ export interface AskarQueueTransportRepositoryOptions {
   maxBytesPerConnection?: number;
   /** @default 5 * 1024 * 1024 (5 MB) */
   maxMessageBytes?: number;
-  /** @default ONE_WEEK_MS (7 days); 0 disables */
+  /** @default ONE_WEEK_MS (7 days); 0 disables TTL eviction */
   messageTtlMs?: number;
-  /** Rate-based abuse detection. Pass `false` to disable. */
+  /** Rate-based abuse detection; `false` disables it. */
   abuse?: AbuseMonitorOptions | false;
 }
 
-/**
- * A persistent {@link DidCommQueueTransportRepository} backed by the agent's
- * storage service (Askar → Postgres), so queued messages survive a mediator
- * restart. Credo ships only an in-memory queue; this is the durable equivalent.
- *
- * Bounding notes — the generic storage API has no COUNT/SUM aggregate and no
- * sort, so:
- *  - per-connection caps load that connection's pending rows (bounded by the
- *    cap) and enforce count/bytes + drop-oldest in memory,
- *  - TTL eviction is applied to those same rows, and
- *  - the global cap is enforced with reject-when-full using an in-memory
- *    counter seeded once from the store (persistence makes the backing resource
- *    disk, not RAM, so a hard global ceiling is a coarse disk guardrail).
- */
+// Persistent queue backed by the agent's storage service (Askar -> Postgres),
+// so queued messages survive a restart. Per-connection caps + drop-oldest are
+// enforced in memory over that connection's rows; the global cap is
+// reject-when-full via a lazily-seeded counter (storage API has no COUNT/sort).
 export class AskarQueueTransportRepository implements DidCommQueueTransportRepository {
   private readonly maxMessagesPerConnection: number;
   private readonly maxMessagesTotal: number;
@@ -56,12 +46,8 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
   private globalPending?: number;
   private globalSeed?: Promise<number>;
 
-  // Per-connection write serialization. With processDidCommMessagesConcurrently
-  // enabled, addMessage/takeFromQueue for the same connection can interleave and
-  // race (double drop-oldest, cap overshoot). Chaining them per connection keeps
-  // each connection's queue consistent while different connections still run
-  // concurrently. NOTE: this guards a single process only — running multiple
-  // mediator instances against one database would need DB-level locking.
+  // Serializes writes per connection so concurrent processing can't race the
+  // queue. Single-process only; multiple instances would need DB-level locking.
   private readonly connectionLocks = new Map<string, Promise<unknown>>();
 
   public constructor(options: AskarQueueTransportRepositoryOptions = {}) {
@@ -83,12 +69,9 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
     if (this.messageTtlMs < 0) throw new CredoError('messageTtlMs must be >= 0');
   }
 
-  /** Run `fn` serially with respect to other operations on the same connection. */
   private withConnectionLock<T>(connectionId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.connectionLocks.get(connectionId) ?? Promise.resolve();
     const result = previous.then(fn, fn);
-    // Keep a settled (error-swallowed) tail so the chain never breaks; drop the
-    // entry once this op is the last one, to bound the map size.
     const tail = result.then(
       () => undefined,
       () => undefined,
@@ -218,11 +201,7 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
     const { connectionId, recipientDids, payload } = options;
     const logger = agentContext.config.logger;
 
-    // Abuse detection and the per-message size check touch no DB state, so run
-    // them before taking the per-connection lock — abusive floods are rejected
-    // cheaply without serializing behind other work.
-
-    // 1. Abuse detection: turn away a flooding connection cheaply (no DB hit).
+    // Checked before the lock so floods are rejected without serializing.
     if (this.abuseMonitor?.record(connectionId)) {
       logger.warn(`Mediator blocked forward from connection ${connectionId}: abusive send rate`);
       throw new MediatorAbuseDetectedError(
@@ -230,7 +209,6 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
       );
     }
 
-    // 2. Per-message size cap.
     const byteSize = Buffer.byteLength(JSON.stringify(payload), 'utf8');
     if (byteSize > this.maxMessageBytes) {
       throw new MediatorQueueLimitReachedError(
@@ -242,12 +220,10 @@ export class AskarQueueTransportRepository implements DidCommQueueTransportRepos
       const repository = this.getRepository(agentContext);
       await this.ensureGlobalCount(agentContext, repository);
 
-      // 3. Global cap: reject when full (disk guardrail).
       if ((this.globalPending ?? 0) >= this.maxMessagesTotal) {
         throw new MediatorQueueLimitReachedError(`Global message queue is full (${this.maxMessagesTotal} messages)`);
       }
 
-      // 4. Per-connection caps (count + bytes): drop oldest to make room.
       const pending = await this.loadPending(agentContext, repository, connectionId);
       pending.sort((a, b) => a.receivedAtMs - b.receivedAtMs); // oldest first
       let currentCount = pending.length;
